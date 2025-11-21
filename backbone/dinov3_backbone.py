@@ -1,9 +1,9 @@
+import os
 import torch
-from torch import nn, functional as F
-import numpy as np
+from torch import nn
 
-dinov3_dir = "..\dinov3"
-dinov3_weights_dir = "..\checkpoints"
+dinov3_dir = os.path.join(".", "dinov3")
+dinov3_weights_dir = os.path.join(".", "checkpoints")
 
 class dinov3_Backbone(nn.Module):
     def __init__(self,
@@ -12,18 +12,17 @@ class dinov3_Backbone(nn.Module):
         super(dinov3_Backbone, self).__init__()
         if model == "vitb16":
             hub_model_name = "dinov3_vitb16"
-            default_weights = "dinov3_vitb16_pretrain.pth"
+            weights = "dinov3_vitb16_pretrain.pth"
         elif model == "vitl16":
             hub_model_name = "dinov3_vitl16"
-            default_weights = "dinov3_vitl16_pretrain.pth"
+            weights = "dinov3_vitl16_pretrain.pth"
         elif model == "vith16plus":
             hub_model_name = "dinov3_vith16plus"
-            default_weights = "dinov3_vith16plus_pretrain.pth"
+            weights = "dinov3_vith16plus_pretrain.pth"
         else:
             raise ValueError(f"Unsupported model: {model}")
         
-        weights_name = default_weights
-        weights_path = f"{dinov3_weights_dir}/{weights_name}"
+        weights_path = os.path.join(dinov3_weights_dir, weights)
 
         self.model = torch.hub.load(
             dinov3_dir,
@@ -31,12 +30,24 @@ class dinov3_Backbone(nn.Module):
             source="local",
             weights=weights_path,
         )
+        for p in self.model.parameters():
+                p.requires_grad = False
+        
+        self.model.eval()
 
     def forward(self,x):
-        self.model.eval(requires_grad=False)
-        
         out = self.model.forward_features(x)  
-        return out
+
+        # shape: [B, N, C]
+        tokens = out["x_norm_patchtokens"]    
+        B, N, C = tokens.shape
+
+        H_feat = int(N ** 0.5)
+        W_feat = H_feat
+        tokens = tokens.permute(0, 2, 1)          # [B, C, N]
+        feat = tokens.reshape(B, C, H_feat, W_feat)  # [B, C, H_feat, W_feat]
+
+        return feat
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
