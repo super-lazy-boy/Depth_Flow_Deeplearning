@@ -5,11 +5,11 @@ from torch import nn
 dinov3_dir = os.path.join(".", "dinov3")
 dinov3_weights_dir = os.path.join(".", "checkpoints")
 
-class dinov3_Backbone(nn.Module):
+class dinov3(nn.Module):
     def __init__(self,
                  model=None,
                  ):
-        super(dinov3_Backbone, self).__init__()
+        super(dinov3, self).__init__()
         if model == "vitb16":
             hub_model_name = "dinov3_vitb16"
             weights = "dinov3_vitb16_pretrain.pth"
@@ -49,13 +49,49 @@ class dinov3_Backbone(nn.Module):
 
         return feat
 
+class Dinov3Encoder(nn.Module):
+    def __init__(self, output_dim=128, model='vitb16', dropout=0.0):
+        super(Dinov3Encoder, self).__init__()
+        self.backbone = dinov3(model=model)
+        self.dropout = None
+        if dropout > 0:
+            self.dropout = nn.Dropout2d(p=dropout)
+
+        if model == 'vitb16':
+            input_dim = 768
+        elif model == 'vitl16':
+            input_dim = 1024
+        else: 
+            ValueError(f"Unsupported model: {model}")
+        
+        self.conv2 = nn.Conv2d(input_dim, output_dim, kernel_size=1)
+
+    def forward(self, x):
+        # if input is list, combine batch dimension
+        is_list = isinstance(x, tuple) or isinstance(x, list)
+        if is_list:
+            batch_dim = x[0].shape[0]
+            x = torch.cat(x, dim=0)
+
+        x = self.backbone(x)
+        x = self.conv2(x)
+
+        if self.training and self.dropout is not None:
+            x = self.dropout(x)
+
+        if is_list:
+            x = torch.split(x, [batch_dim, batch_dim], dim=0)
+        return x
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # 假设输入 512x512
     dummy = torch.randn(2, 3, 512, 512).to(device)
 
-    backbone = dinov3_Backbone(
-        model="vitb16"
+    backbone = Dinov3Encoder(
+        model="vitb16",
+        output_dim=128,
+        dropout=0.0,
     ).to(device)
 
     with torch.no_grad():
