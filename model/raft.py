@@ -116,6 +116,18 @@ class RAFT(nn.Module):
         
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
+
+        B, C_img, H_img, W_img = image1.shape
+        Hc = H_img // 8
+        Wc = W_img // 8
+        if fmap1.shape[2] != Hc or fmap1.shape[3] != Wc:
+            # 这里使用双线性插值，把 [B, C, 46, 156] 变成 [B, C, 47, 156]
+            fmap1 = F.interpolate(fmap1, size=(Hc, Wc), mode='bilinear', align_corners=False)
+            fmap2 = F.interpolate(fmap2, size=(Hc, Wc), mode='bilinear', align_corners=False)
+
+        assert fmap1.shape[2] == Hc and fmap1.shape[3] == Wc, \
+            f"Feature map size {fmap1.shape[2:]} does not match expected {(Hc, Wc)}"    
+
         if self.args.alternate_corr:
             corr_fn = AlternateCorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
         else:
@@ -124,9 +136,18 @@ class RAFT(nn.Module):
         # run the context network
         with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
             cnet = self.cnet(image1)
-            net, inp = torch.split(cnet, [hdim, cdim], dim=1)
-            net = torch.tanh(net)
-            inp = torch.relu(inp)
+        cnet = cnet.float()
+
+        # 如果 cnet 的空间分辨率和 (Hc, Wc) 不一致，一样插值过去
+        if cnet.shape[2] != Hc or cnet.shape[3] != Wc:
+            cnet = F.interpolate(cnet, size=(Hc, Wc), mode='bilinear', align_corners=False)
+
+        # 防御式检查：确保最终 cnet 的 H、W 和 fmap / coords 一致
+        assert cnet.shape[2] == Hc and cnet.shape[3] == Wc, \
+            f"cnet spatial size {cnet.shape[2:]} != expected {(Hc, Wc)}"
+        net, inp = torch.split(cnet, [hdim, cdim], dim=1)
+        net = torch.tanh(net)
+        inp = torch.relu(inp)
 
         coords0, coords1 = self.initialize_flow(image1)
 
@@ -136,6 +157,9 @@ class RAFT(nn.Module):
         flow_predictions = []
         for itr in range(iters):
             coords1 = coords1.detach()
+            # print("feat fmap shape:", fmap1.shape)  # 一般是 [B, C, Hc, Wc]
+            # print("coords1 shape before flatten:", coords1.shape)
+
             corr = corr_fn(coords1) # index correlation volume
 
             flow = coords1 - coords0

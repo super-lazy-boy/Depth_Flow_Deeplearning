@@ -22,6 +22,12 @@ from datasets import datasets
 from torch.utils.tensorboard import SummaryWriter
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from datasets.split_dataset import mk_file
+# from utils_training_plot import train_with_plot, plot_curves
+
 try:
     from torch.amp import GradScaler
 except:
@@ -134,34 +140,87 @@ class Logger:
         self.writer.close()
 
 
+def plot_curves(train_losses, train_epe_list):
+    """
+    train_losses: 每个 epoch 的平均 loss
+    train_epe_list: 每个 epoch 的平均 EPE（我们用它当作“精度指标”的反向度量，越低越好）
+    """
+    epochs = range(1, len(train_losses)+1)
+
+    plt.figure(figsize=(10,5))
+
+    # Loss 曲线
+    plt.subplot(1,2,1)
+    plt.plot(epochs, train_losses, marker='o')
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+
+    # EPE 曲线（替代 accuracy）
+    plt.subplot(1,2,2)
+    plt.plot(epochs, train_epe_list, color='orange', marker='o')
+    plt.title('Training EPE')
+    plt.xlabel('Epoch')
+    plt.ylabel('EPE (pixels)')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
 def train(args):
 
     model = nn.DataParallel(RAFT(args), device_ids=args.gpus)
+    # print("Parameter Count: %d" % count_parameters(model))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = RAFT(args).to(device)
     print("Parameter Count: %d" % count_parameters(model))
 
     if args.restore_ckpt is not None:
+        #加载已有的模型权重
         model.load_state_dict(torch.load(args.restore_ckpt), strict=False)
 
-    model.cuda()
+    # model.cuda()
     model.train()
 
-    if args.datasets != 'chairs':
-        model.module.freeze_bn()
+    # if args.datasets != 'chairs':
+    #     model.module.freeze_bn()
 
     train_loader = datasets.fetch_dataloader(args)
     optimizer, scheduler = fetch_optimizer(args, model)
+    criterion = torch.nn.CrossEntropyLoss()
 
-    total_steps = 0
-    scaler = GradScaler('cuda', enabled=args.mixed_precision)
+    # total_steps = 0
+    scaler = GradScaler(enabled=args.mixed_precision)
     logger = Logger(model, scheduler)
 
-    VAL_FREQ = 5000
+    # VAL_FREQ = 5000
     add_noise = True
 
     should_keep_training = True
-    while should_keep_training:
+
+    mk_file('training_checkpoints')
+
+    # train_losses, train_accuracies = train_with_plot(
+    #     model, train_loader, optimizer, criterion, num_epochs=args.num_steps , device=device
+    # )
+
+    train_loss_history = []
+    train_epe_history = []
+    epochs = args.num_steps
+    
+
+    for epoch in range(epochs):
+
+        epoch_loss_sum = 0.0
+        epoch_epe_sum = 0.0
+        epoch_batches = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
 
         for i_batch, data_blob in enumerate(train_loader):
+
+            
             optimizer.zero_grad()
             image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
@@ -182,35 +241,52 @@ def train(args):
             scaler.update()
 
             logger.push(metrics)
+            epoch_loss_sum += loss.item()
+            epoch_epe_sum += metrics['epe']
+            epoch_batches += 1
 
-            if total_steps % VAL_FREQ == VAL_FREQ - 1:
-                PATH = 'checkpoints/%d_%s.pth' % (total_steps+1, args.name)
-                torch.save(model.state_dict(), PATH)
+            progress_bar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "epe": f"{metrics['epe']:.3f}"
+            })
 
-                results = {}
-                for val_dataset in args.validation:
-                    if val_dataset == 'chairs':
-                        results.update(evaluate.validate_chairs(model.module))
-                    elif val_dataset == 'sintel':
-                        results.update(evaluate.validate_sintel(model.module))
-                    elif val_dataset == 'kitti':
-                        results.update(evaluate.validate_kitti(model.module))
+        avg_loss = epoch_loss_sum / max(epoch_batches, 1)
+        avg_epe  = epoch_epe_sum  / max(epoch_batches, 1)
+        train_loss_history.append(avg_loss)
+        train_epe_history.append(avg_epe)
+        print(f"[Epoch {epoch+1}/{epochs}] train loss = {avg_loss:.4f}, train EPE = {avg_epe:.3f}")
 
-                logger.write_dict(results)
-                
-                model.train()
-                if args.stage != 'chairs':
-                    model.module.freeze_bn()
+        model.eval()
+        with torch.no_grad():
+            val_results = {}
+            for val_dataset in args.validation:
+                if val_dataset == 'chairs':
+                    val_results.update(evaluate.validate_chairs(model.module))
+                elif val_dataset == 'sintel':
+                    val_results.update(evaluate.validate_sintel(model.module))
+                elif val_dataset == 'kitti':
+                    val_results.update(evaluate.validate_kitti(model.module))
+            logger.write_dict(val_results)
+
+        if 'kitti-epe' in val_results:
+            print(f"          val kitti EPE = {val_results['kitti-epe']:.3f}")
+
+        if epoch % 200 == 0 or epoch == epochs - 1:
+            ckpt_path = f"training_checkpoints/epoch{epoch+1}_{args.name}.pth"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"[Checkpoint] Saved: {ckpt_path}")
             
-            total_steps += 1
+        model.train()
+        if args.stage != 'chairs':
+            model.module.freeze_bn()
 
-            if total_steps > args.num_steps:
-                should_keep_training = False
-                break
+
 
     logger.close()
     PATH = 'train_checkpoints/%s.pth' % args.name
     torch.save(model.state_dict(), PATH)
+    print(f"[Final] Model saved to: {PATH}")
+    plot_curves(train_loss_history, train_epe_history)
 
     return PATH
 
@@ -225,11 +301,11 @@ if __name__ == '__main__':
         validation='kitti', # 想在哪些验证集上评估
 
         lr=2e-5,
-        num_steps=500,
-        batch_size=6,
+        num_steps=2000,
+        batch_size=4,
         image_size=[320, 1152],
         gpus=[0],                       # 如果你只有一块卡就写 [0]
-        mixed_precision=True,          # 显卡够的话也可以 True
+        mixed_precision=False,          # 显卡够的话也可以 True
 
         iters=12,
         wdecay=0.00005,

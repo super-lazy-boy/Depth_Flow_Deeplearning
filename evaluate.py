@@ -95,7 +95,6 @@ def validate_chairs(model, iters=24):
 @torch.no_grad()
 def validate_sintel(model, iters=32):
     """ Peform validation using the Sintel (train) split """
-    model.eval()
     results = {}
     for dstype in ['clean', 'final']:
         val_dataset = datasets.MpiSintel(split='training', dstype=dstype)
@@ -130,7 +129,6 @@ def validate_sintel(model, iters=32):
 @torch.no_grad()
 def validate_kitti(model, iters=24):
     """ Peform validation using the KITTI-2015 (train) split """
-    model.eval()
     val_dataset = datasets.KITTI(split='training')
 
     out_list, epe_list = [], []
@@ -168,6 +166,7 @@ def validate_kitti(model, iters=24):
 
 if __name__ == '__main__':
     base = os.path.dirname(__file__)
+    #获取训练好的模型权重路径
     ckpt_path = os.path.join(base, "train_checkpoints", "raft.pth")
 
     args = SimpleNamespace(
@@ -180,9 +179,11 @@ if __name__ == '__main__':
         image_size=[320, 1152],
         mixed_precision = True,
         alternate_corr = False,
+        gpus=[0],  
+        corr_radius = 4
         )
 
-    model = torch.nn.DataParallel(RAFT(args))
+    model = torch.nn.DataParallel(RAFT(args), device_ids=args.gpus)
     model.load_state_dict(torch.load(args.model),"cuda")
 
     model.cuda()
