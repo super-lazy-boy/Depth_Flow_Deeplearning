@@ -4,7 +4,7 @@ sys.path.append('core')
 
 import argparse
 import os
-import cv2
+# import cv2
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -140,7 +140,7 @@ class Logger:
         self.writer.close()
 
 
-def plot_curves(train_losses, train_epe_list):
+def plot_curves(train_losses, train_epe_list,save_path="result/train_curves.png"):
     """
     train_losses: 每个 epoch 的平均 loss
     train_epe_list: 每个 epoch 的平均 EPE（我们用它当作“精度指标”的反向度量，越低越好）
@@ -148,6 +148,9 @@ def plot_curves(train_losses, train_epe_list):
     epochs = range(1, len(train_losses)+1)
 
     plt.figure(figsize=(10,5))
+    save_dir = os.path.dirname(save_path)
+    if save_dir != "" and not os.path.exists(save_dir):
+        os.makedirs(save_dir)
 
     # Loss 曲线
     plt.subplot(1,2,1)
@@ -168,12 +171,16 @@ def plot_curves(train_losses, train_epe_list):
     plt.tight_layout()
     plt.show()
 
+    plt.savefig(save_path, dpi=300)
+    print(f"[INFO] Saved training curves to {save_path}")
+
 
 def train(args):
 
-    model = nn.DataParallel(RAFT(args), device_ids=args.gpus)
     # print("Parameter Count: %d" % count_parameters(model))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = nn.DataParallel(RAFT(args), device_ids=args.gpus)
+    model = model.to(device)
     # model = RAFT(args).to(device)
     print("Parameter Count: %d" % count_parameters(model))
 
@@ -216,18 +223,20 @@ def train(args):
         epoch_loss_sum = 0.0
         epoch_epe_sum = 0.0
         epoch_batches = 0
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        progress_bar = tqdm(train_loader,total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}",dynamic_ncols=True)
 
-        for i_batch, data_blob in enumerate(train_loader):
+        for i_batch, data_blob in enumerate(progress_bar):
 
             
             optimizer.zero_grad()
-            image1, image2, flow, valid = [x.cuda() for x in data_blob]
+            image1, image2, flow, valid = [x.to(device, non_blocking=True)for x in data_blob]
 
             if args.add_noise:
                 stdv = np.random.uniform(0.0, 5.0)
-                image1 = (image1 + stdv * torch.randn(*image1.shape).cuda()).clamp(0.0, 255.0)
-                image2 = (image2 + stdv * torch.randn(*image2.shape).cuda()).clamp(0.0, 255.0)
+                noise1 = stdv * torch.randn_like(image1) 
+                noise2 = stdv * torch.randn_like(image2)
+                image1 = (image1 + noise1).clamp(0.0, 255.0)
+                image2 = (image2 + noise2).clamp(0.0, 255.0)
 
             flow_predictions = model(image1, image2, iters=args.iters)            
 
@@ -277,7 +286,7 @@ def train(args):
             print(f"[Checkpoint] Saved: {ckpt_path}")
             
         model.train()
-        if args.stage != 'chairs':
+        if args.datasets != 'chairs':
             model.module.freeze_bn()
 
 
@@ -294,17 +303,18 @@ def train(args):
 if __name__ == '__main__':
     args = SimpleNamespace(
         name='raft',
-        datasets='kitti',              #datasets for training: 'chairs', 'things', 'sintel', 'kitti'
+        datasets='kitti',              #datasets for training: 'chairs', 'things', 'sintel', 'kitti','chairs2'
         restore_ckpt=None,              # 或 'checkpoints/raft-things.pth'
         feat_type='dinov3',           #['small','basic','dinov3'] # 选择特征提取骨干网络
         dinov3_model='vitb16',      #['vitb16','vitl16'] # dinov3 模型类型
         validation='kitti', # 想在哪些验证集上评估
 
         lr=2e-5,
-        num_steps=2000,
-        batch_size=4,
+        num_steps=3000,
+        batch_size=16,
+        crop_size=[320, 448],# FlyingChairs2 推荐使用这个尺寸
         image_size=[320, 1152],
-        gpus=[0],                       # 如果你只有一块卡就写 [0]
+        gpus=[0, 1, 2, 3],                       # 如果你只有一块卡就写 [0]
         mixed_precision=False,          # 显卡够的话也可以 True
 
         iters=12,
@@ -324,4 +334,13 @@ if __name__ == '__main__':
     if not os.path.isdir('train_checkpoints'):
         os.mkdir('train_checkpoints')
 
+    args.datasets = 'chairs2'  # 选择训练数据集
+    args.name ='raft_chairs2_stage1'
+    args.restore_ckpt = None 
+    train(args)
+
+    args.datasets = 'kitti'  # 选择训练数据集
+    args.name ='raft_chairs2_kitti_ft'
+    args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
+    args.num_steps = 1000
     train(args)

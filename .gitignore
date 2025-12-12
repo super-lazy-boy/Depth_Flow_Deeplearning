@@ -3,5 +3,6 @@ checkpoints/
 dinov3/
 runs/
 train_checkpoints/
+training_checkpoints/
 alt_cuda_corr/
 *.zip
