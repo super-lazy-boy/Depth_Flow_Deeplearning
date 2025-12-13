@@ -48,7 +48,7 @@ except:
 # exclude extremly large displacements
 MAX_FLOW = 400
 SUM_FREQ = 100
-VAL_FREQ = 5000
+VAL_FREQ = 100
 
 
 def sequence_loss(flow_preds, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
@@ -83,11 +83,14 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def fetch_optimizer(args, model):
+def fetch_optimizer(args, model,train_loader):
     """ Create the optimizer and learning rate scheduler """
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.num_steps
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=args.epsilon)
 
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, total_steps=total_steps,
         pct_start=0.05, cycle_momentum=False, anneal_strategy='linear')
 
     return optimizer, scheduler
@@ -195,7 +198,7 @@ def train(args):
     #     model.module.freeze_bn()
 
     train_loader = datasets.fetch_dataloader(args)
-    optimizer, scheduler = fetch_optimizer(args, model)
+    optimizer, scheduler = fetch_optimizer(args, model,train_loader)
     criterion = torch.nn.CrossEntropyLoss()
 
     # total_steps = 0
@@ -310,7 +313,7 @@ if __name__ == '__main__':
         validation='kitti', # 想在哪些验证集上评估
 
         lr=2e-5,
-        num_steps=3000,
+        num_steps=1,
         batch_size=16,
         crop_size=[320, 448],# FlyingChairs2 推荐使用这个尺寸
         image_size=[320, 1152],
@@ -336,11 +339,11 @@ if __name__ == '__main__':
 
     args.datasets = 'chairs2'  # 选择训练数据集
     args.name ='raft_chairs2_stage1'
-    args.restore_ckpt = None 
+    args.restore_ckpt = 'pretrain/raft-things.pth'
     train(args)
 
     args.datasets = 'kitti'  # 选择训练数据集
     args.name ='raft_chairs2_kitti_ft'
     args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
-    args.num_steps = 1000
+    args.num_steps = 1
     train(args)
