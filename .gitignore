@@ -6,3 +6,10 @@ train_checkpoints/
 training_checkpoints/
 alt_cuda_corr/
 *.zip
+*.tar.gz
+*.pth
+*.ckpt
+pretrain/
+Depth_Flow_Deeplearning/__pycache__/
+*.pyc
+*.yaml

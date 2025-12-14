@@ -143,7 +143,7 @@ class Logger:
         self.writer.close()
 
 
-def plot_curves(train_losses, train_epe_list,save_path="result/train_curves.png"):
+def plot_curves(train_losses, train_epe_list, save_path="result"):
     """
     train_losses: 每个 epoch 的平均 loss
     train_epe_list: 每个 epoch 的平均 EPE（我们用它当作“精度指标”的反向度量，越低越好）
@@ -151,7 +151,7 @@ def plot_curves(train_losses, train_epe_list,save_path="result/train_curves.png"
     epochs = range(1, len(train_losses)+1)
 
     plt.figure(figsize=(10,5))
-    save_dir = os.path.dirname(save_path)
+    save_dir = f"{save_path}/{args.name}"
     if save_dir != "" and not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
@@ -174,6 +174,7 @@ def plot_curves(train_losses, train_epe_list,save_path="result/train_curves.png"
     plt.tight_layout()
     plt.show()
 
+    save_path = f"{save_dir}/{args.stage}_curves.png"
     plt.savefig(save_path, dpi=300)
     print(f"[INFO] Saved training curves to {save_path}")
 
@@ -193,6 +194,7 @@ def train(args):
 
     # model.cuda()
     model.train()
+    args.stage = "train"
 
     # if args.datasets != 'chairs':
     #     model.module.freeze_bn()
@@ -218,6 +220,9 @@ def train(args):
 
     train_loss_history = []
     train_epe_history = []
+
+    val_epe_history = []
+    val_f1_history = []
     epochs = args.num_steps
     
 
@@ -269,6 +274,7 @@ def train(args):
         print(f"[Epoch {epoch+1}/{epochs}] train loss = {avg_loss:.4f}, train EPE = {avg_epe:.3f}")
 
         model.eval()
+        args.stage = "val"
         with torch.no_grad():
             val_results = {}
             for val_dataset in args.validation:
@@ -280,6 +286,8 @@ def train(args):
                     val_results.update(evaluate.validate_kitti(model.module))
             logger.write_dict(val_results)
 
+        val_epe_history.append(val_results.get('kitti', 0.0))
+        val_f1_history.append(val_results.get('kitti-f1', 0.0))
         if 'kitti-epe' in val_results:
             print(f"          val kitti EPE = {val_results['kitti-epe']:.3f}")
 
@@ -289,6 +297,7 @@ def train(args):
             print(f"[Checkpoint] Saved: {ckpt_path}")
             
         model.train()
+        args.stage = "train"
         if args.datasets != 'chairs':
             model.module.freeze_bn()
 
@@ -299,6 +308,7 @@ def train(args):
     torch.save(model.state_dict(), PATH)
     print(f"[Final] Model saved to: {PATH}")
     plot_curves(train_loss_history, train_epe_history)
+    plot_curves(val_epe_history, val_f1_history)
 
     return PATH
 
@@ -311,14 +321,15 @@ if __name__ == '__main__':
         feat_type='dinov3',           #['small','basic','dinov3'] # 选择特征提取骨干网络
         dinov3_model='vitb16',      #['vitb16','vitl16'] # dinov3 模型类型
         validation='kitti', # 想在哪些验证集上评估
+        stage = "train",
 
         lr=2e-5,
-        num_steps=1,
-        batch_size=16,
+        num_steps=10,
+        batch_size=64,
         crop_size=[320, 448],# FlyingChairs2 推荐使用这个尺寸
         image_size=[320, 1152],
-        gpus=[0, 1, 2, 3],                       # 如果你只有一块卡就写 [0]
-        mixed_precision=False,          # 显卡够的话也可以 True
+        gpus=[0, 1, 2, 3, 4, 5],                       # 如果你只有一块卡就写 [0]
+        mixed_precision=True,          # 显卡够的话也可以 True
 
         iters=12,
         wdecay=0.00005,
@@ -339,11 +350,11 @@ if __name__ == '__main__':
 
     args.datasets = 'chairs2'  # 选择训练数据集
     args.name ='raft_chairs2_stage1'
-    args.restore_ckpt = 'pretrain/raft-things.pth'
+    args.restore_ckpt = None
     train(args)
 
     args.datasets = 'kitti'  # 选择训练数据集
     args.name ='raft_chairs2_kitti_ft'
     args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
-    args.num_steps = 1
+    args.num_steps = 200
     train(args)

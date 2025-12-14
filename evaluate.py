@@ -16,6 +16,7 @@ from datasets import frame_utils
 from model.raft import RAFT
 from model.flow.utils import InputPadder, forward_interpolate
 from types import SimpleNamespace
+from train import plot_curves
 
 
 @torch.no_grad()
@@ -154,6 +155,7 @@ def validate_kitti(model, iters=24):
         epe_list.append(epe[val].mean().item())
         out_list.append(out[val].cpu().numpy())
 
+    
     epe_list = np.array(epe_list)
     out_list = np.concatenate(out_list)
 
