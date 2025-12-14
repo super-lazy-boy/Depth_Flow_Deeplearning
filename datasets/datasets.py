@@ -158,6 +158,31 @@ class FlyingThings3D(FlowDataset):
                             self.flow_list += [ flows[i+1] ]
       
 
+class FlyingChairs2(FlowDataset):
+    def __init__(self, aug_params=None, split='train',
+                 root='data/FlyingChairs2'):
+        super(FlyingChairs2, self).__init__(aug_params)
+
+        # 拼出路径，例如 data/FlyingChairs2/train
+        root = osp.join(root, split)
+
+        # 读取 image0, image1, flow01
+        img0_list = sorted(glob(osp.join(root, '*-img_0.png')))
+        img1_list = sorted(glob(osp.join(root, '*-img_1.png')))
+        flow_list = sorted(glob(osp.join(root, '*-flow_01.flo')))
+
+        print(f"[FlyingChairs2] Found {len(img0_list)} samples in {root}")
+
+        assert len(img0_list) == len(img1_list) == len(flow_list), \
+            "Images and flow files count mismatch!"
+
+        # 保存到基类的 list 中
+        for i in range(len(flow_list)):
+            self.flow_list.append(flow_list[i])
+            self.image_list.append([img0_list[i], img1_list[i]])
+
+
+
 class KITTI(FlowDataset):
     def __init__(self, aug_params=None, split='training', root='data/KITTI_splited'):
         super(KITTI, self).__init__(aug_params, sparse=True)
@@ -224,6 +249,16 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
 
         elif TRAIN_DS == 'C+T+K/S':
             train_dataset = 100*sintel_clean + 100*sintel_final + things
+    
+    elif args.datasets == 'chairs2':
+        # FlyingChairs2 的增广策略一般和 chairs 一样即可
+        aug_params = {
+            'crop_size': args.crop_size,
+            'min_scale': -0.1,
+            'max_scale': 1.0,
+            'do_flip': True
+        }
+        train_dataset = FlyingChairs2(aug_params, split='train')
 
     elif args.datasets == 'kitti':
         aug_params = {'crop_size': args.image_size, 'min_scale': -0.2, 'max_scale': 0.4, 'do_flip': False}

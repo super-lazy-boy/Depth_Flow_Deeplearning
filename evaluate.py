@@ -167,7 +167,7 @@ def validate_kitti(model, iters=24):
 if __name__ == '__main__':
     base = os.path.dirname(__file__)
     #获取训练好的模型权重路径
-    ckpt_path = os.path.join(base, "train_checkpoints", "raft.pth")
+    ckpt_path = os.path.join(base, "train_checkpoints", "raft_chairs2_kitti_ft.pth")
 
     args = SimpleNamespace(
         model = ckpt_path,
