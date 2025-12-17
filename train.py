@@ -143,12 +143,13 @@ class Logger:
         self.writer.close()
 
 
-def plot_curves(train_losses, train_epe_list, save_path="result"):
+def plot_curves(list, title, xlabel= "epoch", save_path="result"):
     """
     train_losses: 每个 epoch 的平均 loss
     train_epe_list: 每个 epoch 的平均 EPE（我们用它当作“精度指标”的反向度量，越低越好）
     """
-    epochs = range(1, len(train_losses)+1)
+    epochs = range(1, len(list)+1)
+    ylabel = title
 
     plt.figure(figsize=(10,5))
     save_dir = f"{save_path}/{args.name}"
@@ -156,25 +157,17 @@ def plot_curves(train_losses, train_epe_list, save_path="result"):
         os.makedirs(save_dir)
 
     # Loss 曲线
-    plt.subplot(1,2,1)
-    plt.plot(epochs, train_losses, marker='o')
-    plt.title('Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.grid(True)
-
-    # EPE 曲线（替代 accuracy）
-    plt.subplot(1,2,2)
-    plt.plot(epochs, train_epe_list, color='orange', marker='o')
-    plt.title('Training EPE')
-    plt.xlabel('Epoch')
-    plt.ylabel('EPE (pixels)')
+    plt.subplot(1,1,1)
+    plt.plot(epochs, list, marker='o')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
     plt.grid(True)
 
     plt.tight_layout()
     plt.show()
 
-    save_path = f"{save_dir}/{args.stage}_curves.png"
+    save_path = f"{save_dir}/{title}.png"
     plt.savefig(save_path, dpi=300)
     print(f"[INFO] Saved training curves to {save_path}")
 
@@ -194,7 +187,7 @@ def train(args):
 
     # model.cuda()
     model.train()
-    args.stage = "train"
+   
 
     # if args.datasets != 'chairs':
     #     model.module.freeze_bn()
@@ -274,7 +267,7 @@ def train(args):
         print(f"[Epoch {epoch+1}/{epochs}] train loss = {avg_loss:.4f}, train EPE = {avg_epe:.3f}")
 
         model.eval()
-        args.stage = "val"
+        
         with torch.no_grad():
             val_results = {}
             for val_dataset in args.validation:
@@ -286,7 +279,7 @@ def train(args):
                     val_results.update(evaluate.validate_kitti(model.module))
             logger.write_dict(val_results)
 
-        val_epe_history.append(val_results.get('kitti', 0.0))
+        val_epe_history.append(val_results.get('kitti-epe', 0.0))
         val_f1_history.append(val_results.get('kitti-f1', 0.0))
         if 'kitti-epe' in val_results:
             print(f"          val kitti EPE = {val_results['kitti-epe']:.3f}")
@@ -297,18 +290,21 @@ def train(args):
             print(f"[Checkpoint] Saved: {ckpt_path}")
             
         model.train()
-        args.stage = "train"
-        if args.datasets != 'chairs':
+        
+        if args.datasets != 'chairs2':
             model.module.freeze_bn()
-
 
 
     logger.close()
     PATH = 'train_checkpoints/%s.pth' % args.name
     torch.save(model.state_dict(), PATH)
     print(f"[Final] Model saved to: {PATH}")
-    plot_curves(train_loss_history, train_epe_history)
-    plot_curves(val_epe_history, val_f1_history)
+    args.stage ="train"
+    plot_curves(train_loss_history,"trian_loss")
+    plot_curves(train_epe_history,"train_EPE")
+    plot_curves(val_epe_history,"val_kitti_EPE")
+    plot_curves(val_f1_history,"val_kitti_F1")
+
 
     return PATH
 
@@ -324,7 +320,7 @@ if __name__ == '__main__':
         stage = "train",
 
         lr=2e-5,
-        num_steps=10,
+        num_steps=1,
         batch_size=64,
         crop_size=[320, 448],# FlyingChairs2 推荐使用这个尺寸
         image_size=[320, 1152],
@@ -348,13 +344,14 @@ if __name__ == '__main__':
     if not os.path.isdir('train_checkpoints'):
         os.mkdir('train_checkpoints')
 
-    args.datasets = 'chairs2'  # 选择训练数据集
-    args.name ='raft_chairs2_stage1'
+    # args.datasets = 'chairs2'  # 选择训练数据集
+    # args.name ='raft_chairs2_stage1'
     args.restore_ckpt = None
     train(args)
 
     args.datasets = 'kitti'  # 选择训练数据集
-    args.name ='raft_chairs2_kitti_ft'
-    args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
-    args.num_steps = 200
+    # args.name ='raft_chairs2_kitti_ft'
+    args.name ='test'
+    # args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
+    args.num_steps = 5
     train(args)

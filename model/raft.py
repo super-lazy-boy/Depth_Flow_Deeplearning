@@ -8,6 +8,7 @@ from model.feat.extractor import BasicEncoder, SmallEncoder
 from model.feat.corr import CorrBlock, AlternateCorrBlock
 from model.feat.dinov3 import Dinov3Encoder
 from model.flow.utils import bilinear_sampler, coords_grid, upflow8
+from model.adapter import Adapter
 
 # try:
 #     autocast = torch.cuda.amp.autocast
@@ -68,6 +69,10 @@ class RAFT(nn.Module):
             self.cnet = Dinov3Encoder(output_dim=hdim+cdim, model='vitb16', dropout=args.dropout)
             self.update_block = BasicUpdateBlock(self.args, hidden_dim=hdim)
 
+        self.flow_adapter = Adapter(channels=256)
+
+
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -114,6 +119,9 @@ class RAFT(nn.Module):
         with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])        
         
+        fmap1 = self.flow_adapter(fmap1)
+        fmap2 = self.flow_adapter(fmap2)
+
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
 

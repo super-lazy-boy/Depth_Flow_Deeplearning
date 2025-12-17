@@ -1,6 +1,7 @@
 data/
 checkpoints/
 dinov3/
+Depth_Flow_Deeplearning/
 runs/
 train_checkpoints/
 training_checkpoints/
@@ -10,6 +11,7 @@ alt_cuda_corr/
 *.pth
 *.ckpt
 pretrain/
+result/
 Depth_Flow_Deeplearning/__pycache__/
 *.pyc
 *.yaml
