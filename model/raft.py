@@ -9,6 +9,7 @@ from model.feat.corr import CorrBlock, AlternateCorrBlock
 from model.feat.dinov3 import Dinov3Encoder
 from model.flow.utils import bilinear_sampler, coords_grid, upflow8, InputPadder
 from model.adapter import Adapter
+from model.feat.extractor import ResNetFPN
 
 from model.depth_anything_v2.dpt import DepthAnythingV2
 ckpt_path = "checkpoints/depth_anything_v2_vitb.pth"
@@ -102,6 +103,7 @@ class ZAQ(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden, 1, 3, padding=1),
         )
+        self.bnet = ResNetFPN(args, input_dim=16, output_dim=hdim+cdim, norm_layer=nn.BatchNorm2d, init_weight=False)
 
         # self._hook = self.depth_model.depth_head.scratch.output_conv1.register_forward_hook(self._save_feat)
 
@@ -240,9 +242,9 @@ class ZAQ(nn.Module):
             corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
         # run the context network
-        cnet_input = torch.cat((image1, image2), 1)
+        # cnet_input = torch.cat((image1, image2), 1)
         with torch.amp.autocast('cuda', enabled=self.args.mixed_precision):
-            cnet = self.cnet(cnet_input)
+            cnet = self.cnet(image1)
         cnet = cnet.float()
         net, inp = torch.split(cnet, [hdim, cdim], dim=1)
 

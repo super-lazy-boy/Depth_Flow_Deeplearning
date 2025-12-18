@@ -320,6 +320,7 @@ if __name__ == '__main__':
         validation='kitti', # 想在哪些验证集上评估
         stage = "train",
         da_size = "vitb",
+        pretrain = 'resnet34',
 
         lr=2e-5,
         num_steps=1,
