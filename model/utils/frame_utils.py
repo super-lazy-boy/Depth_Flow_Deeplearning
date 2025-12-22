@@ -1,8 +1,12 @@
-#based on RAFT
+# This file includes code from SEA-RAFT (https://github.com/princeton-vl/SEA-RAFT)
+# Copyright (c) 2024, Princeton Vision & Learning Lab
+# Licensed under the BSD 3-Clause License
+
 import numpy as np
 from PIL import Image
 from os.path import *
 import re
+import h5py
 
 import cv2
 cv2.setNumThreads(0)
@@ -119,7 +123,16 @@ def writeFlowKITTI(filename, uv):
     valid = np.ones([uv.shape[0], uv.shape[1], 1])
     uv = np.concatenate([uv, valid], axis=-1).astype(np.uint16)
     cv2.imwrite(filename, uv[..., ::-1])
-    
+
+def readFlo5Flow(filename):
+    with h5py.File(filename, "r") as f:
+        if "flow" not in f.keys():
+            raise IOError(f"File {filename} does not have a 'flow' key. Is this a valid flo5 file?")
+        return f["flow"][()]
+
+def writeFlo5File(flow, filename):
+    with h5py.File(filename, "w") as f:
+        f.create_dataset("flow", data=flow, compression="gzip", compression_opts=5)
 
 def read_gen(file_name, pil=False):
     ext = splitext(file_name)[-1]
@@ -135,4 +148,6 @@ def read_gen(file_name, pil=False):
             return flow
         else:
             return flow[:, :, :-1]
+    elif ext == '.flo5':
+        return readFlo5Flow(file_name)
     return []

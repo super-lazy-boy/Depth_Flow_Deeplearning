@@ -15,17 +15,20 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
-from model.raft import ZAQ
-import evaluate
-from datasets import datasets
+# from model.raft import ZAQ
+from model.flowseek import FlowSeek
+# import evaluate
+from model.datasets import fetch_dataloader
 
 from torch.utils.tensorboard import SummaryWriter
 from types import SimpleNamespace
+from model.utils.utils import InputPadder
+from model.loss import sequence_loss
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from datasets.split_dataset import mk_file
+from split_dataset import mk_file
 # from utils_training_plot import train_with_plot, plot_curves
 
 try:
@@ -51,32 +54,32 @@ SUM_FREQ = 100
 VAL_FREQ = 100
 
 
-def sequence_loss(flow_preds, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
-    """ Loss function defined over sequence of flow predictions """
+# def sequence_loss(flow_preds, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
+#     """ Loss function defined over sequence of flow predictions """
 
-    n_predictions = len(flow_preds)    
-    flow_loss = 0.0
+#     n_predictions = len(flow_preds)    
+#     flow_loss = 0.0
 
-    # exlude invalid pixels and extremely large diplacements
-    mag = torch.sum(flow_gt**2, dim=1).sqrt()
-    valid = (valid >= 0.5) & (mag < max_flow)
+#     # exlude invalid pixels and extremely large diplacements
+#     mag = torch.sum(flow_gt**2, dim=1).sqrt()
+#     valid = (valid >= 0.5) & (mag < max_flow)
 
-    for i in range(n_predictions):
-        i_weight = gamma**(n_predictions - i - 1)
-        i_loss = (flow_preds[i] - flow_gt).abs()
-        flow_loss += i_weight * (valid[:, None] * i_loss).mean()
+#     for i in range(n_predictions):
+#         i_weight = gamma**(n_predictions - i - 1)
+#         i_loss = (flow_preds[i] - flow_gt).abs()
+#         flow_loss += i_weight * (valid[:, None] * i_loss).mean()
 
-    epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
-    epe = epe.view(-1)[valid.view(-1)]
+#     epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
+#     epe = epe.view(-1)[valid.view(-1)]
 
-    metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
-    }
+#     metrics = {
+#         'epe': epe.mean().item(),
+#         '1px': (epe < 1).float().mean().item(),
+#         '3px': (epe < 3).float().mean().item(),
+#         '5px': (epe < 5).float().mean().item(),
+#     }
 
-    return flow_loss, metrics
+#     return flow_loss, metrics
 
 
 def count_parameters(model):
@@ -95,6 +98,39 @@ def fetch_optimizer(args, model,train_loader):
 
     return optimizer, scheduler
     
+@torch.no_grad()
+def validate_kitti_flowseek(model, iters=24):
+    model.eval()
+    val_dataset = datasets.KITTI(split='training')
+
+    out_list, epe_list = [], []
+    for val_id in range(len(val_dataset)):
+        image1, image2, flow_gt, valid_gt = val_dataset[val_id]
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
+
+        padder = InputPadder(image1.shape, mode='kitti')
+        image1, image2 = padder.pad(image1, image2)
+
+        out = model(image1, image2, iters=iters, test_mode=True)
+        flow = padder.unpad(out['final'])[0].cpu()
+
+        epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
+        mag = torch.sum(flow_gt**2, dim=0).sqrt()
+
+        epe = epe.view(-1)
+        mag = mag.view(-1)
+        val = valid_gt.view(-1) >= 0.5
+
+        outlier = ((epe > 3.0) & ((epe / mag) > 0.05)).float()
+        epe_list.append(epe[val].mean().item())
+        out_list.append(outlier[val].cpu().numpy())
+
+    epe = float(np.mean(np.array(epe_list)))
+    f1 = float(100 * np.mean(np.concatenate(out_list)))
+
+    print("Validation KITTI: %f, %f" % (epe, f1))
+    return {'kitti-epe': epe, 'kitti-f1': f1}
 
 class Logger:
     def __init__(self, model, scheduler):
@@ -176,7 +212,8 @@ def train(args):
 
     # print("Parameter Count: %d" % count_parameters(model))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = nn.DataParallel(ZAQ(args), device_ids=args.gpus)
+    # model = nn.DataParallel(ZAQ(args), device_ids=args.gpus)
+    model = nn.DataParallel(FlowSeek(args), device_ids=args.gpus)
     model = model.to(device)
     # model = ZAQ(args).to(device)
     print("Parameter Count: %d" % count_parameters(model))
@@ -192,7 +229,7 @@ def train(args):
     # if args.datasets != 'chairs':
     #     model.module.freeze_bn()
 
-    train_loader = datasets.fetch_dataloader(args)
+    train_loader = fetch_dataloader(args)
     optimizer, scheduler = fetch_optimizer(args, model,train_loader)
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -239,9 +276,9 @@ def train(args):
                 image1 = (image1 + noise1).clamp(0.0, 255.0)
                 image2 = (image2 + noise2).clamp(0.0, 255.0)
 
-            flow_predictions = model(image1, image2, iters=args.iters)            
+            output = model(image1, image2, iters=args.iters, flow_gt=flow, test_mode=False)
+            loss, metrics = sequence_loss(output, flow, valid, gamma=args.gamma)
 
-            loss, metrics = sequence_loss(flow_predictions, flow, valid, args.gamma)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
@@ -270,13 +307,14 @@ def train(args):
         
         with torch.no_grad():
             val_results = {}
-            for val_dataset in args.validation:
-                if val_dataset == 'chairs':
-                    val_results.update(evaluate.validate_chairs(model.module))
-                elif val_dataset == 'sintel':
-                    val_results.update(evaluate.validate_sintel(model.module))
-                elif val_dataset == 'kitti':
-                    val_results.update(evaluate.validate_kitti(model.module))
+            # for val_dataset in args.validation:
+            #     if val_dataset == 'chairs':
+            #         val_results.update(evaluate.validate_chairs(model.module))
+            #     elif val_dataset == 'sintel':
+            #         val_results.update(evaluate.validate_sintel(model.module))
+            #     elif val_dataset == 'kitti':
+            #         val_results.update(evaluate.validate_kitti(model.module))
+            val_results.update(validate_kitti_flowseek(model.module, iters=args.iters))
             logger.write_dict(val_results)
 
         val_epe_history.append(val_results.get('kitti-epe', 0.0))
@@ -311,33 +349,38 @@ def train(args):
 
 if __name__ == '__main__':
     args = SimpleNamespace(
-        name='raft',
-        datasets='kitti',              #datasets for training: 'chairs', 'things', 'sintel', 'kitti','chairs2'
-        restore_ckpt=None,              # 或 'checkpoints/raft-things.pth'
-        feat_type='dinov3',           #['small','basic','dinov3'] # 选择特征提取骨干网络
-        dinov3_model='vitb16',      #['vitb16','vitl16'] # dinov3 模型类型
-        device ="cuda" if torch.cuda.is_available() else "cpu",
-        validation='kitti', # 想在哪些验证集上评估
-        stage = "train",
-        da_size = "vitb",
-        pretrain = 'resnet34',
+        name="flowseek",
+        dataset="kitti",
+        gpus=[0],
 
-        lr=2e-5,
-        num_steps=1,
-        batch_size=64,
-        crop_size=[320, 448],# FlyingChairs2 推荐使用这个尺寸
-        image_size=[320, 1152],
-        gpus=[0, 1, 2, 3, 4, 5],                       # 如果你只有一块卡就写 [0]
-        mixed_precision=True,          # 显卡够的话也可以 True
+        use_var=True,
+        var_min=0,
+        var_max=10,
+        pretrain="resnet34",
+        initial_dim=64,
+        block_dims=[64, 128, 256],
+        radius=4,
+        dim=128,
+        num_blocks=2,
+        iters=4,
+        restore_ckpt=None,
+        add_noise=False,
 
-        iters=12,
-        wdecay=0.00005,
+        image_size=[480, 640],
+        scale=0,
+        batch_size=4,
         epsilon=1e-8,
+        lr=4e-4,
+        wdecay=1e-5,
+        dropout=0,
         clip=1.0,
-        dropout=0.0,
-        gamma=0.8,
-        add_noise=False,                # 想用噪声增强就改成 True
-        alternate_corr=False            # 没有 alt_cuda_corr 扩展就 False
+        gamma=0.85,
+        num_steps=2,
+        seed=42,
+        mixed_precision=True,
+        paths={'kitti': './data/KITTI/'},
+
+        da_size="vitb"
     )
 
 
@@ -347,14 +390,14 @@ if __name__ == '__main__':
     if not os.path.isdir('train_checkpoints'):
         os.mkdir('train_checkpoints')
 
-    # args.datasets = 'chairs2'  # 选择训练数据集
-    # args.name ='raft_chairs2_stage1'
-    args.restore_ckpt = None
-    train(args)
+    # # args.datasets = 'chairs2'  # 选择训练数据集
+    # # args.name ='raft_chairs2_stage1'
+    # args.restore_ckpt = None
+    # train(args)
 
-    args.datasets = 'kitti'  # 选择训练数据集
-    # args.name ='raft_chairs2_kitti_ft'
-    args.name ='test'
-    # args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
-    args.num_steps = 5
+    # args.datasets = 'kitti'  # 选择训练数据集
+    # # args.name ='raft_chairs2_kitti_ft'
+    # args.name ='test'
+    # # args.restore_ckpt = 'train_checkpoints/raft_chairs2_stage1.pth'
+    # args.num_steps = 5
     train(args)

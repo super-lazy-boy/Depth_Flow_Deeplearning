@@ -1,4 +1,7 @@
-#based on RAFT
+# This file includes code from SEA-RAFT (https://github.com/princeton-vl/SEA-RAFT)
+# Copyright (c) 2024, Princeton Vision & Learning Lab
+# Licensed under the BSD 3-Clause License
+
 import numpy as np
 import random
 import math
@@ -11,10 +14,10 @@ cv2.ocl.setUseOpenCL(False)
 import torch
 from torchvision.transforms import ColorJitter
 import torch.nn.functional as F
-
+from . import flow_transforms 
 
 class FlowAugmentor:
-    def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True):
+    def __init__(self, crop_size, min_scale=-0.2, max_scale=0.5, do_flip=True, pwc_aug=False):
         
         # spatial augmentation params
         self.crop_size = crop_size
@@ -33,6 +36,9 @@ class FlowAugmentor:
         self.photo_aug = ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.5/3.14)
         self.asymmetric_color_aug_prob = 0.2
         self.eraser_aug_prob = 0.5
+        self.pwc_aug = pwc_aug
+        if self.pwc_aug:
+            print("[Using pwc-style spatial augmentation]")
 
     def color_transform(self, img1, img2):
         """ Photometric augmentation """
@@ -77,8 +83,7 @@ class FlowAugmentor:
         scale_y = scale
         if np.random.rand() < self.stretch_prob:
             scale_x *= 2 ** np.random.uniform(-self.max_stretch, self.max_stretch)
-            scale_y *= 2 ** np.random.uniform(-self.max_stretch, self.max_stretch)
-        
+            scale_y *= 2 ** np.random.uniform(-self.max_stretch, self.max_stretch)        
         scale_x = np.clip(scale_x, min_scale, None)
         scale_y = np.clip(scale_y, min_scale, None)
 
@@ -100,8 +105,14 @@ class FlowAugmentor:
                 img2 = img2[::-1, :]
                 flow = flow[::-1, :] * [1.0, -1.0]
 
-        y0 = np.random.randint(0, img1.shape[0] - self.crop_size[0])
-        x0 = np.random.randint(0, img1.shape[1] - self.crop_size[1])
+        if img1.shape[0] == self.crop_size[0]:
+            y0 = 0
+        else:
+            y0 = np.random.randint(0, img1.shape[0] - self.crop_size[0])
+        if img1.shape[1] == self.crop_size[1]:
+            x0 = 0
+        else:
+            x0 = np.random.randint(0, img1.shape[1] - self.crop_size[1])
         
         img1 = img1[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         img2 = img2[y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
@@ -112,7 +123,24 @@ class FlowAugmentor:
     def __call__(self, img1, img2, flow):
         img1, img2 = self.color_transform(img1, img2)
         img1, img2 = self.eraser_transform(img1, img2)
-        img1, img2, flow = self.spatial_transform(img1, img2, flow)
+        if self.pwc_aug:
+            th, tw = self.crop_size
+            schedule = [0.5, 1.]  # initial coeff, final_coeff, half life
+            difficulty = np.random.uniform(0, 1)
+            schedule_coeff = schedule[0] + (schedule[1] - schedule[0]) * \
+              (2/(1+np.exp(-1.0986*difficulty)) - 1)
+            spatial_augmentor = flow_transforms.SpatialAug([th,tw],scale=[0.4,0.03,0.2],
+                                                rot=[0.4,0.03],
+                                                trans=[0.4,0.03],
+                                                squeeze=[0.3,0.], schedule_coeff=schedule_coeff, order=1, black=False)
+            flow = np.concatenate([flow, np.ones((flow.shape[0], flow.shape[1], 1))], axis=-1)
+            augmented, flow_valid = spatial_augmentor([img1, img2], flow)
+            flow = flow_valid[:,:,:2]
+            img1 = augmented[0]
+            img2 = augmented[1]
+
+        else:
+            img1, img2, flow = self.spatial_transform(img1, img2, flow)
 
         img1 = np.ascontiguousarray(img1)
         img2 = np.ascontiguousarray(img2)
@@ -194,6 +222,19 @@ class SparseFlowAugmentor:
         return flow_img, valid_img
 
     def spatial_transform(self, img1, img2, flow, valid):
+        pad_t = 0
+        pad_b = 0
+        pad_l = 0
+        pad_r = 0
+        if self.crop_size[0] > img1.shape[0]:
+            pad_b = self.crop_size[0] - img1.shape[0]
+        if self.crop_size[1] > img1.shape[1]:
+            pad_r = self.crop_size[1] - img1.shape[1]
+        if pad_b != 0 or pad_r != 0:
+            img1 = np.pad(img1, ((pad_t, pad_b), (pad_l, pad_r), (0, 0)), 'constant', constant_values=((0, 0), (0, 0), (0, 0)))
+            img2 = np.pad(img2, ((pad_t, pad_b), (pad_l, pad_r), (0, 0)), 'constant', constant_values=((0, 0), (0, 0), (0, 0)))
+            flow = np.pad(flow, ((pad_t, pad_b), (pad_l, pad_r), (0, 0)), 'constant', constant_values=((0, 0), (0, 0), (0, 0)))
+            valid = np.pad(valid, ((pad_t, pad_b), (pad_l, pad_r)), 'constant', constant_values=((0, 0), (0, 0)))
         # randomly sample scale
 
         ht, wd = img1.shape[:2]
@@ -237,11 +278,10 @@ class SparseFlowAugmentor:
     def __call__(self, img1, img2, flow, valid):
         img1, img2 = self.color_transform(img1, img2)
         img1, img2 = self.eraser_transform(img1, img2)
-        img1, img2, flow, valid = self.spatial_transform(img1, img2, flow, valid)
 
+        img1, img2, flow, valid = self.spatial_transform(img1, img2, flow, valid)
         img1 = np.ascontiguousarray(img1)
         img2 = np.ascontiguousarray(img2)
         flow = np.ascontiguousarray(flow)
         valid = np.ascontiguousarray(valid)
-
         return img1, img2, flow, valid
