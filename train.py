@@ -220,6 +220,9 @@ def depth_l1_loss(depth_pred, depth, depth_valid, eps=1e-6):
 
 
 def train(args):
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True   
 
     # print("Parameter Count: %d" % count_parameters(model))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -241,6 +244,9 @@ def train(args):
     #     model.module.freeze_bn()
 
     train_loader = fetch_dataloader(args)
+    # print("fetching one batch...", flush=True)
+    # batch = next(iter(train_loader))
+    # print("batch fetched OK", flush=True)
     optimizer, scheduler = fetch_optimizer(args, model,train_loader)
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -374,7 +380,7 @@ if __name__ == '__main__':
         name="flowseek",
         dataset="kitti",
         stage="train",
-        gpus=[0,1],
+        gpus=[0],
         validation=['kitti'],
         use_var=True,
         var_min=0,
@@ -391,7 +397,7 @@ if __name__ == '__main__':
 
         image_size=[480, 640],
         scale=0,
-        batch_size=4,
+        batch_size=1,
         epsilon=1e-8,
         lr=4e-4,
         wdecay=1e-5,
@@ -400,7 +406,7 @@ if __name__ == '__main__':
         gamma=0.85,
         num_steps=2,
         seed=42,
-        mixed_precision=True,
+        mixed_precision=False,
         paths={'kitti': './data/KITTI/'},
 
         da_size="vitb"

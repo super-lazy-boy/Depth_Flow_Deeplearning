@@ -117,7 +117,7 @@ class FlowDataset(data.Dataset):
 
         if self.augmentor is not None:
             if self.sparse:
-                img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+                img1, img2, flow, flow_valid = self.augmentor(img1, img2, flow, flow_valid)
             else:
                 img1, img2, flow = self.augmentor(img1, img2, flow)
 
@@ -132,12 +132,22 @@ class FlowDataset(data.Dataset):
             flow_valid = torch.from_numpy(flow_valid)
         else:
             flow_valid = (flow[0].abs() < 1000) & (flow[1].abs() < 1000)
-        if depth_valid is None:
-                depth_valid = torch.ones((H, W), dtype=torch.float32)
+        if depth is None:
+            # 没有深度监督（如 KITTI flow）
+            depth = torch.zeros((1, H, W), dtype=torch.float32)      # [1,H,W]
+            depth_valid = torch.zeros((H, W), dtype=torch.float32)  # [H,W]
         else:
-            depth_valid = torch.from_numpy(depth_valid).float()
+            depth = torch.from_numpy(depth).float()
+            if depth.dim() == 2:
+                depth = depth.unsqueeze(0)  # [1,H,W]
 
-        return img1, img2, flow, flow_valid.float(), depth, depth_valid.float()
+            if depth_valid is None:
+                depth_valid = torch.ones((H, W), dtype=torch.float32)
+            else:
+                depth_valid = torch.from_numpy(depth_valid).float()
+
+
+        return img1, img2, flow,  depth, flow_valid.float(),depth_valid.float()
 
 
     def __rmul__(self, v):
@@ -602,7 +612,7 @@ def fetch_dataloader(args, rank=0, world_size=1, use_ddp=False):
         train_dataset = 20 * sintel_clean + 20 * sintel_final + 80 * kitti + 30 * hd1k + things
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=False, shuffle=True, num_workers=8, drop_last=True, worker_init_fn=seed_worker, generator=g)
+        pin_memory=False, shuffle=True, num_workers=0, drop_last=True, worker_init_fn=seed_worker, generator=g)
 
     print('Training with %d image pairs' % len(train_dataset))
     return train_loader
