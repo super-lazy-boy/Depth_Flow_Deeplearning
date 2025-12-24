@@ -380,7 +380,7 @@ if __name__ == '__main__':
         name="flowseek",
         dataset="kitti",
         stage="train",
-        gpus=[0],
+        gpus=[0,1],
         validation=['kitti'],
         use_var=True,
         var_min=0,
@@ -395,9 +395,9 @@ if __name__ == '__main__':
         restore_ckpt=None,
         add_noise=False,
 
-        image_size=[480, 640],
+        image_size=[384, 512],
         scale=0,
-        batch_size=1,
+        batch_size=2,
         epsilon=1e-8,
         lr=4e-4,
         wdecay=1e-5,
@@ -407,7 +407,8 @@ if __name__ == '__main__':
         num_steps=2,
         seed=42,
         mixed_precision=False,
-        paths={'kitti': './data/KITTI/'},
+        paths={'kitti': './data/KITTI/',
+               'chairs':'./data/FlyingChairs/data'},
 
         da_size="vitb"
     )
