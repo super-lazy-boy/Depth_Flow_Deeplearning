@@ -14,6 +14,63 @@ import os.path as osp
 from model.utils import frame_utils
 from model.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
+def _read_kitti_disparity_png(path: str) -> np.ndarray:
+    """
+    KITTI disparity PNG (disp_noc_0) is typically 16-bit PNG where disp = value / 256.
+    Returns float32 disparity map with shape [H, W].
+    """
+    disp = frame_utils.read_gen(path)          # usually PIL.Image
+    disp = np.array(disp).astype(np.float32)
+    # common KITTI encoding:
+    disp = disp / 256.0
+    return disp
+
+def _pad_to(t: torch.Tensor, H: int, W: int):
+    # t: [C,H,W]
+    _, h, w = t.shape
+    pad_h = H - h
+    pad_w = W - w
+    if pad_h == 0 and pad_w == 0:
+        return t
+    # pad format: (left, right, top, bottom)
+    return torch.nn.functional.pad(t, (0, pad_w, 0, pad_h))
+
+def pad_collate_fn(batch):
+    """
+    batch is list of tuples:
+    (img1, img2, flow, flow_valid, depth, depth_valid)
+    Each tensor is [C,H,W] except flow_valid might be [H,W] in some implementations.
+    We pad all spatial tensors to max(H,W) in this batch.
+    """
+    imgs1, imgs2, flows, fvalids, depths, dvalids = zip(*batch)
+
+    # find max H,W over all tensors that have 3 dims
+    H = 0
+    W = 0
+    for t in list(imgs1) + list(imgs2) + list(flows) + list(depths) + list(dvalids):
+        if t is None:
+            continue
+        if t.dim() == 3:
+            H = max(H, t.shape[1])
+            W = max(W, t.shape[2])
+
+    imgs1 = torch.stack([_pad_to(t, H, W) for t in imgs1], dim=0)
+    imgs2 = torch.stack([_pad_to(t, H, W) for t in imgs2], dim=0)
+    flows = torch.stack([_pad_to(t, H, W) for t in flows], dim=0)
+
+    # flow_valid may be [H,W] or [1,H,W] depending on your dataset code
+    fvalid_list = []
+    for v in fvalids:
+        if v.dim() == 2:
+            v = v.unsqueeze(0)
+        fvalid_list.append(_pad_to(v, H, W))
+    fvalids = torch.stack(fvalid_list, dim=0)
+
+    depths = torch.stack([_pad_to(t, H, W) for t in depths], dim=0)
+    dvalids = torch.stack([_pad_to(t, H, W) for t in dvalids], dim=0)
+
+    return imgs1, imgs2, flows, fvalids, depths, dvalids
+
 
 class FlowDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False):
@@ -43,6 +100,7 @@ class FlowDataset(data.Dataset):
             img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
             return img1, img2, self.extra_info[index]
 
+        # worker seed init
         if not self.init_seed:
             worker_info = torch.utils.data.get_worker_info()
             if worker_info is not None:
@@ -52,12 +110,15 @@ class FlowDataset(data.Dataset):
                 self.init_seed = True
 
         index = index % len(self.image_list)
+
+        # ---------- flow ----------
         flow_valid = None
         if self.sparse:
             flow, flow_valid = frame_utils.readFlowKITTI(self.flow_list[index])
         else:
             flow = frame_utils.read_gen(self.flow_list[index])
 
+        # ---------- images ----------
         img1 = frame_utils.read_gen(self.image_list[index][0])
         img2 = frame_utils.read_gen(self.image_list[index][1])
 
@@ -65,44 +126,66 @@ class FlowDataset(data.Dataset):
         img1 = np.array(img1).astype(np.uint8)
         img2 = np.array(img2).astype(np.uint8)
 
-        # grayscale images
+        # grayscale -> 3ch
         if len(img1.shape) == 2:
-            img1 = np.tile(img1[...,None], (1, 1, 3))
-            img2 = np.tile(img2[...,None], (1, 1, 3))
+            img1 = np.tile(img1[..., None], (1, 1, 3))
+            img2 = np.tile(img2[..., None], (1, 1, 3))
         else:
             img1 = img1[..., :3]
             img2 = img2[..., :3]
 
+        # ---------- depth / disparity supervision ----------
         depth = None
         depth_valid = None
         if len(self.depth_list) > 0:
-            depth = frame_utils.read_gen(self.depth_list[index])
-            depth = np.array(depth).astype(np.float32)
+            dpath = self.depth_list[index]
+
+            # KITTI disparity supervision (disp_noc_0) is 16-bit png: disp = val/256
+            if isinstance(dpath, str) and (("disp_noc_0" in dpath) or ("disp_occ_0" in dpath)) and dpath.endswith(".png"):
+                depth = _read_kitti_disparity_png(dpath)  # actually disparity
+            else:
+                depth_img = frame_utils.read_gen(dpath)
+                depth = np.array(depth_img).astype(np.float32)
+
             depth_valid = (depth > 0).astype(np.float32)
 
+        # augmentation (if enabled)
         if self.augmentor is not None:
             if self.sparse:
                 img1, img2, flow, flow_valid = self.augmentor(img1, img2, flow, flow_valid)
             else:
                 img1, img2, flow = self.augmentor(img1, img2, flow)
 
+        # to torch
         img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
         img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
         flow = torch.from_numpy(flow).permute(2, 0, 1).float()
-        depth = torch.from_numpy(depth).unsqueeze(0).float() if depth is not None else None
-        depth_valid = torch.from_numpy(depth_valid).unsqueeze(0).float() if depth_valid is not None else None
+
+        # IMPORTANT: never return None for DataLoader default_collate
+        # If depth is missing, return zeros + all-zero valid mask.
+        if depth is None:
+            H, W = img1.shape[1], img1.shape[2]
+            depth = torch.zeros(1, H, W).float()
+            depth_valid = torch.zeros(1, H, W).float()
+        else:
+            depth = torch.from_numpy(depth).unsqueeze(0).float()
+            depth_valid = torch.from_numpy(depth_valid).unsqueeze(0).float()
 
         if flow_valid is not None:
-            flow_valid = torch.from_numpy(flow_valid)
+            flow_valid = torch.from_numpy(flow_valid).float()
         else:
-            flow_valid = (flow[0].abs() < 1000) & (flow[1].abs() < 1000)
+            flow_valid = ((flow[0].abs() < 1000) & (flow[1].abs() < 1000)).float()
 
-        return img1, img2, flow, flow_valid.float(), depth, depth_valid
+        # Return order MUST match train.py unpacking
+        # img1, img2, flow, flow_valid, depth, depth_valid
+        return img1, img2, flow, flow_valid, depth, depth_valid
 
 
     def __rmul__(self, v):
         self.flow_list = v * self.flow_list
         self.image_list = v * self.image_list
+        if len(self.depth_list) > 0:
+            self.depth_list = v * self.depth_list
         return self
         
     def __len__(self):
@@ -185,7 +268,7 @@ class KITTI(FlowDataset):
 
         if split == 'training':
             self.flow_list = sorted(glob(osp.join(root, 'flow_occ/*_10.png')))
-            self.disp0_list = sorted(glob(osp.join(root, 'disp_noc_0/*_10.png')))  
+            self.depth_list = sorted(glob(osp.join(root, 'disp_noc_0/*_10.png')))  
 
 
 class HD1K(FlowDataset):
@@ -239,7 +322,7 @@ def fetch_dataloader(args, TRAIN_DS='C+T+K+S+H'):
         train_dataset = KITTI(aug_params, split='training', root=args.paths['kitti'])
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=False, shuffle=True, num_workers=4, drop_last=True)
+        pin_memory=False, shuffle=True, num_workers=4, drop_last=True, collate_fn=pad_collate_fn)
 
     print('Training with %d image pairs' % len(train_dataset))
     return train_loader

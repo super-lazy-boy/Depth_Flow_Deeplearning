@@ -35,7 +35,12 @@ def sequence_loss(output, flow_gt, valid, gamma=0.8, max_flow=MAX_FLOW):
 
     # exclude invalid pixels and extremely large displacements
     mag = torch.sum(flow_gt ** 2, dim=1).sqrt()                 # [B,H,W]
-    valid_mask = (valid >= 0.5) & (mag < max_flow)              # [B,H,W]
+    if valid.dim() == 4 and valid.size(1) == 1:
+        valid = valid[:, 0]   # squeeze channel
+    elif valid.dim() == 2:
+        valid = valid.unsqueeze(0)
+
+    valid_mask = valid >= 0.5
 
     for i in range(n_predictions):
         i_weight = gamma ** (n_predictions - i - 1)
