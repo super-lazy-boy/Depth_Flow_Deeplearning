@@ -3,6 +3,12 @@
 import os
 from shutil import copy,rmtree
 import random
+import argparse
+import os
+import random
+import shutil
+from glob import glob
+from pathlib import Path
 
 def mk_file(file_path: str):
     if os.path.exists(file_path):
@@ -10,47 +16,91 @@ def mk_file(file_path: str):
         rmtree(file_path)
     os.makedirs(file_path)
 
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", type=str, default="./data/KITTI",
+                    help="KITTI root dir that contains 'training/'")
+    ap.add_argument("--ratio", type=float, default=0.9,
+                    help="train split ratio (e.g., 0.9 -> 90% train, 10% val)")
+    ap.add_argument("--seed", type=int, default=42, help="random seed")
+    ap.add_argument("--copy", action="store_true",
+                    help="copy files instead of symlink (default: symlink)")
+    return ap.parse_args()
+
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+def main():
+    args = parse_args()
+    random.seed(args.seed)
+
+    training_dir = Path(args.data_root) / "training"
+    assert training_dir.exists(), f"{training_dir} not found"
+
+    # Required subfolders
+    subdirs = ["image_2", "flow_occ", "disp_noc_0", "calib_cam_to_cam"]
+
+    for s in subdirs:
+        assert (training_dir / s).exists(), f"Missing {s} in training"
+
+    # Collect frame ids from image_2/*_10.png
+    img10 = sorted(glob(str(training_dir / "image_2" / "*_10.png")))
+    frame_ids = [Path(p).stem.split("_")[0] for p in img10]
+
+    assert len(frame_ids) > 0, "No frames found"
+
+    # Shuffle and split
+    idx = list(range(len(frame_ids)))
+    random.shuffle(idx)
+    n_train = int(len(idx) * args.ratio)
+    train_idx = set(idx[:n_train])
+    val_idx = set(idx[n_train:])
+
+    out_root = Path(args.data_root + "_split")
+    train_out = out_root / "train"
+    val_out = out_root / "val"
+
+    for base in [train_out, val_out]:
+        for s in subdirs:
+            ensure_dir(base / s)
+
+    def link_or_copy(src, dst):
+        if args.copy:
+            shutil.copy2(src, dst)
+        else:
+            # create symlink
+            if os.path.exists(dst):
+                return
+            os.symlink(os.path.abspath(src), dst)
+
+    for i, fid in enumerate(frame_ids):
+        target = train_out if i in train_idx else val_out
+
+        # image_2
+        for suffix in ["_10.png", "_11.png"]:
+            src = training_dir / "image_2" / f"{fid}{suffix}"
+            dst = target / "image_2" / f"{fid}{suffix}"
+            link_or_copy(src, dst)
+
+        # flow
+        src = training_dir / "flow_occ" / f"{fid}_10.png"
+        dst = target / "flow_occ" / f"{fid}_10.png"
+        link_or_copy(src, dst)
+
+        # disparity
+        src = training_dir / "disp_noc_0" / f"{fid}_10.png"
+        dst = target / "disp_noc_0" / f"{fid}_10.png"
+        link_or_copy(src, dst)
+
+        # calibration
+        src = training_dir / "calib_cam_to_cam" / f"{fid}.txt"
+        dst = target / "calib_cam_to_cam" / f"{fid}.txt"
+        link_or_copy(src, dst)
+
+    print(f"Split done.")
+    print(f"Train: {len(train_idx)} samples")
+    print(f"Val  : {len(val_idx)} samples")
+    print(f"Output dir: {out_root}")
+
 if __name__ == "__main__":
-    random.seed(42)
-
-    split_ratio = 0.1  # 10% 用作验证集
-    base_path = "data/KITTI/training"
-    base_image_path = os.path.join(base_path, "image_2")
-    base_flow_path = os.path.join(base_path, "flow_occ")
-
-    # 创建新的数据集的目录结构
-    new_path = os.path.join("data/KITTI_splited")
-    new_train_path = os.path.join(new_path, "training")
-    new_val_path = os.path.join(new_path, "testing")
-    mk_file(new_path)
-    mk_file(new_train_path)
-    mk_file(new_val_path)
-
-    for subfolder in ["image_2", "flow_occ"]:
-        mk_file(os.path.join(new_train_path, subfolder))
-        mk_file(os.path.join(new_val_path, subfolder))
-
-    images = os.listdir(base_image_path)
-    num = len(images)
-
-    for index ,file_name in enumerate(images):
-        if file_name.endswith("_10.png"):
-            # 决定这个样本是放在训练集还是验证集
-            if random.random() < split_ratio:
-                dest_image_folder = os.path.join(new_val_path, "image_2")
-                dest_flow_folder = os.path.join(new_val_path, "flow_occ")
-            else:
-                dest_image_folder = os.path.join(new_train_path, "image_2")
-                dest_flow_folder = os.path.join(new_train_path, "flow_occ")
-
-            # 复制图像对
-            img1_name = file_name
-            img2_name = file_name.replace("_10.png", "_11.png")
-            flow_name = file_name.replace("_10.png", "_10.png")  # 光流文件名与第一个图像对应
-
-            copy(os.path.join(base_image_path, img1_name), os.path.join(dest_image_folder, img1_name))
-            copy(os.path.join(base_image_path, img2_name), os.path.join(dest_image_folder, img2_name))
-            copy(os.path.join(base_flow_path, flow_name), os.path.join(dest_flow_folder, flow_name))
-        print("\r processing [{}/{}]".format(index+1, num), end="")  # processing bar
-
-    print("processing done!")
+    main()

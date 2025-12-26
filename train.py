@@ -56,6 +56,9 @@ def validate_kitti_flowseek(model, kitti_root, iters=24):
     model.eval()
     val_dataset = KITTI(split='training', root=kitti_root)
 
+    progress_bar = tqdm(train_loader, total=len(train_loader),
+                            desc=f"Epoch {epoch+1}/{epochs}", dynamic_ncols=True)
+
     out_list, epe_list = [], []
     for val_id in range(len(val_dataset)):
         # IMPORTANT: KITTI dataset returns: img1,img2,flow,flow_valid,depth,depth_valid
@@ -330,7 +333,7 @@ if __name__ == '__main__':
         mixed_precision=False,
 
         paths={
-            'kitti': './data/KITTI/',
+            'kitti': './data/KITTI_split/',
             'chairs': './data/FlyingChairs/data'
         },
 

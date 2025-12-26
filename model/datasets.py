@@ -71,6 +71,51 @@ def pad_collate_fn(batch):
 
     return imgs1, imgs2, flows, fvalids, depths, dvalids
 
+def read_kitti_fB_from_cam_to_cam_txt(calib_txt_path: str):
+    """
+    从 KITTI 每帧 calib_cam_to_cam/*.txt 里解析 P2/P3 或 P_rect_02/P_rect_03
+    返回 fx(像素焦距) 和 B(基线, 米)
+    """
+    P2 = None
+    P3 = None
+
+    with open(calib_txt_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 兼容两种常见 key：
+            # - raw 风格：P_rect_02 / P_rect_03
+            # - benchmark 风格：P2 / P3 或 P2: / P3:
+            if line.startswith("P_rect_02:") or line.startswith("P2:") or line.startswith("P2 "):
+                vals = [float(x) for x in line.replace("P_rect_02:", "")
+                                           .replace("P2:", "")
+                                           .replace("P2", "")
+                                           .split()]
+                if len(vals) >= 12:
+                    P2 = np.array(vals[:12], dtype=np.float64).reshape(3, 4)
+
+            if line.startswith("P_rect_03:") or line.startswith("P3:") or line.startswith("P3 "):
+                vals = [float(x) for x in line.replace("P_rect_03:", "")
+                                           .replace("P3:", "")
+                                           .replace("P3", "")
+                                           .split()]
+                if len(vals) >= 12:
+                    P3 = np.array(vals[:12], dtype=np.float64).reshape(3, 4)
+
+    if P2 is None or P3 is None:
+        raise ValueError(f"Cannot parse P2/P3 (or P_rect_02/P_rect_03) from: {calib_txt_path}")
+
+    fx = float(P2[0, 0])
+
+    # KITTI 投影矩阵形式：P[0,3] = -fx * Tx
+    Tx2 = -float(P2[0, 3]) / fx
+    Tx3 = -float(P3[0, 3]) / fx
+    B = abs(Tx3 - Tx2)
+
+    return fx, B
+
 
 class FlowDataset(data.Dataset):
     def __init__(self, aug_params=None, sparse=False):
@@ -257,18 +302,70 @@ class KITTI(FlowDataset):
         if split == 'testing':
             self.is_test = True
 
-        root = osp.join(root, split)
-        images1 = sorted(glob(osp.join(root, 'image_2/*_10.png')))
-        images2 = sorted(glob(osp.join(root, 'image_2/*_11.png')))
+        self.root = osp.join(root, split)
+        self.calib_dir = osp.join(self.root, "calib_cam_to_cam")
+
+        images1 = sorted(glob(osp.join(self.root, 'image_2/*_10.png')))
+        images2 = sorted(glob(osp.join(self.root, 'image_2/*_11.png')))
+
+        self.image_list = []
+        self.extra_info = []
+        self.flow_list = []
+        self.depth_list = []   # 我们会把 disp_noc_0 放进 depth_list（先读出来），再转深度
+        self.calib_list = []   # 每个样本对应的 calib txt
 
         for img1, img2 in zip(images1, images2):
-            frame_id = img1.split('/')[-1]
-            self.extra_info += [ [frame_id] ]
-            self.image_list += [ [img1, img2] ]
+            frame_name = osp.basename(img1)          # 000000_10.png
+            frame_id = frame_name.split('_')[0]      # 000000
+
+            calib_path = osp.join(self.calib_dir, f"{frame_id}.txt")
+            self.calib_list.append(calib_path)
+
+            self.extra_info.append([frame_name])
+            self.image_list.append([img1, img2])
 
         if split == 'training':
-            self.flow_list = sorted(glob(osp.join(root, 'flow_occ/*_10.png')))
-            self.depth_list = sorted(glob(osp.join(root, 'disp_noc_0/*_10.png')))  
+            self.flow_list = sorted(glob(osp.join(self.root, 'flow_occ/*_10.png')))
+            disp_list = sorted(glob(osp.join(self.root, 'disp_noc_0/*_10.png')))
+
+            # 关键：让父类 FlowDataset 读取 disp，返回到 depth 字段里（先当作 raw disp）
+            self.depth_list = disp_list
+
+            # 安全检查：确保数量一致，否则会索引错位
+            assert len(self.image_list) == len(self.flow_list) == len(self.depth_list) == len(self.calib_list), \
+                f"List length mismatch: images={len(self.image_list)}, flow={len(self.flow_list)}, " \
+                f"disp={len(self.depth_list)}, calib={len(self.calib_list)}"
+
+    def __getitem__(self, index):
+        """
+        返回：
+        img1, img2: [3,H,W]
+        flow: [2,H,W]
+        flow_valid: [H,W] 或 [1,H,W]（取决于 frame_utils.readFlowKITTI）
+        depth: [1,H,W] (米)
+        depth_valid: [1,H,W]
+        """
+        img1, img2, flow, flow_valid, disp_raw, disp_valid = super(KITTI, self).__getitem__(index)
+
+        # 父类把 disp_noc_0 读到 disp_raw（float32），形状 [1,H,W]
+        # disp_noc_0 的真实值是 disparity*256，需要 /256 还原到像素视差
+        if disp_raw is None:
+            depth = None
+            depth_valid = None
+            return img1, img2, flow, flow_valid, depth, depth_valid
+
+        # 读取本帧的 calib，得到 f 和 B
+        calib_path = self.calib_list[index]
+        fx, B = read_kitti_fB_from_cam_to_cam_txt(calib_path)
+
+        disp = disp_raw / 256.0  # [1,H,W] 视差（像素）
+        valid = (disp > 0.0).float()
+
+        # 深度（米）
+        depth = (fx * B) / (disp + 1e-6)
+        depth_valid = valid
+
+        return img1, img2, flow, flow_valid.float(), depth, depth_valid
 
 
 class HD1K(FlowDataset):
