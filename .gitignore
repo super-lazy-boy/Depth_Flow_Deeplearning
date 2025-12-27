@@ -16,3 +16,4 @@ Depth_Flow_Deeplearning/__pycache__/
 *.pyc
 *.yaml
 *.sh
+result_test/

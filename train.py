@@ -430,14 +430,14 @@ def train(args):
             history[k].append(v)
 
         # checkpoint（更合理：每个 epoch 保存 last；best 按 val/flow_loss）
-        ckpt_last = f"training_checkpoints/last_{args.name}.pth"
+        ckpt_last = f"training_checkpoints/{args.name}/last_{args.name}.pth"
         torch.save(model.state_dict(), ckpt_last)
 
         best_val_loss = float("inf") 
         current_val_loss = val_results.get("val/flow_loss", float("inf"))*args.flow_weight+val_results.get("val/depth_loss", float("inf"))*args.depth_weight
         if current_val_loss < best_val_loss:
             best_val_loss = current_val_loss
-            ckpt_best = f"training_checkpoints/best_{args.name}.pth"
+            ckpt_best = f"training_checkpoints/{args.name}/best_{args.name}.pth"
             torch.save(model.state_dict(), ckpt_best)
             print(f"[Checkpoint] Best updated: val_loss={best_val_loss:.3f} -> {ckpt_best}")
 

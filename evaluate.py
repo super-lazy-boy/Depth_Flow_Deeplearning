@@ -1,207 +1,338 @@
-import sys
-
-from PIL import Image
-import argparse
+# evaluate.py (REPLACEMENT VERSION)
 import os
-import time
+import math
 import numpy as np
-import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-from datasets import datasets
-#from model.flow.utils import flow_viz
-from datasets import frame_utils
-
-from model.raft import ZAQ
-from model.flow.utils import InputPadder, forward_interpolate
 from types import SimpleNamespace
-from train import plot_curves
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# IMPORTANT:
+# This assumes you run evaluate.py at project root where:
+#   - datasets.py exists (module name: datasets)
+#   - model/flowseek.py exists and can be imported as model.flowseek
+import model.datasets as datasets_module
+from model.flowseek import FlowSeek
 
 
-@torch.no_grad()
-def create_sintel_submission(model, iters=32, warm_start=False, output_path='sintel_submission'):
-    """ Create submission for the Sintel leaderboard """
-    model.eval()
-    for dstype in ['clean', 'final']:
-        test_dataset = datasets.MpiSintel(split='test', aug_params=None, dstype=dstype)
-        
-        flow_prev, sequence_prev = None, None
-        for test_id in range(len(test_dataset)):
-            image1, image2, (sequence, frame) = test_dataset[test_id]
-            if sequence != sequence_prev:
-                flow_prev = None
-            
-            padder = InputPadder(image1.shape)
-            image1, image2 = padder.pad(image1[None].cuda(), image2[None].cuda())
-
-            flow_low, flow_pr = model(image1, image2, iters=iters, flow_init=flow_prev, test_mode=True)
-            flow = padder.unpad(flow_pr[0]).permute(1, 2, 0).cpu().numpy()
-
-            if warm_start:
-                flow_prev = forward_interpolate(flow_low[0])[None].cuda()
-            
-            output_dir = os.path.join(output_path, dstype, sequence)
-            output_file = os.path.join(output_dir, 'frame%04d.flo' % (frame+1))
-
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            frame_utils.writeFlow(output_file, flow)
-            sequence_prev = sequence
+# -----------------------------
+# Utils: robust state_dict load
+# -----------------------------
+def _strip_module_prefix(state_dict):
+    """If checkpoint was saved from DataParallel, keys start with 'module.'; strip it."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    keys = list(state_dict.keys())
+    if len(keys) == 0:
+        return state_dict
+    if all(k.startswith("module.") for k in keys):
+        return {k[len("module."):]: v for k, v in state_dict.items()}
+    return state_dict
 
 
-@torch.no_grad()
-def create_kitti_submission(model, iters=24, output_path='kitti_submission'):
-    """ Create submission for the Sintel leaderboard """
-    model.eval()
-    test_dataset = datasets.KITTI(split='testing', aug_params=None)
+def load_checkpoint(model: nn.Module, ckpt_path: str, device: torch.device):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    # Some projects save {"state_dict": ...}
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
 
-    for test_id in range(len(test_dataset)):
-        image1, image2, (frame_id, ) = test_dataset[test_id]
-        padder = InputPadder(image1.shape, mode='kitti')
-        image1, image2 = padder.pad(image1[None].cuda(), image2[None].cuda())
+    ckpt = _strip_module_prefix(ckpt)
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
 
-        _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        flow = padder.unpad(flow_pr[0]).permute(1, 2, 0).cpu().numpy()
-
-        output_filename = os.path.join(output_path, frame_id)
-        frame_utils.writeFlowKITTI(output_filename, flow)
+    print(f"[INFO] Loaded checkpoint: {ckpt_path}")
+    if len(missing) > 0:
+        print(f"[WARN] Missing keys ({len(missing)}): {missing[:20]}{' ...' if len(missing) > 20 else ''}")
+    if len(unexpected) > 0:
+        print(f"[WARN] Unexpected keys ({len(unexpected)}): {unexpected[:20]}{' ...' if len(unexpected) > 20 else ''}")
 
 
-@torch.no_grad()
-def validate_chairs(model, iters=24):
-    """ Perform evaluation on the FlyingChairs (test) split """
-    model.eval()
-    epe_list = []
+# -----------------------------
+# Utils: flow visualization (RAFT-style color wheel)
+# -----------------------------
+def make_colorwheel():
+    """
+    Color wheel as used in many optical flow papers / RAFT codebase style.
+    Returns: [ncols, 3] in uint8.
+    """
+    # RY, YG, GC, CB, BM, MR
+    RY = 15
+    YG = 6
+    GC = 4
+    CB = 11
+    BM = 13
+    MR = 6
+    ncols = RY + YG + GC + CB + BM + MR
+    colorwheel = np.zeros((ncols, 3), dtype=np.uint8)
 
-    val_dataset = datasets.FlyingChairs(split='validation')
-    for val_id in range(len(val_dataset)):
-        image1, image2, flow_gt, _ = val_dataset[val_id]
-        image1 = image1[None].cuda()
-        image2 = image2[None].cuda()
+    col = 0
+    # RY
+    colorwheel[0:RY, 0] = 255
+    colorwheel[0:RY, 1] = np.floor(255 * np.arange(RY) / RY).astype(np.uint8)
+    col += RY
+    # YG
+    colorwheel[col:col+YG, 0] = 255 - np.floor(255 * np.arange(YG) / YG).astype(np.uint8)
+    colorwheel[col:col+YG, 1] = 255
+    col += YG
+    # GC
+    colorwheel[col:col+GC, 1] = 255
+    colorwheel[col:col+GC, 2] = np.floor(255 * np.arange(GC) / GC).astype(np.uint8)
+    col += GC
+    # CB
+    colorwheel[col:col+CB, 1] = 255 - np.floor(255 * np.arange(CB) / CB).astype(np.uint8)
+    colorwheel[col:col+CB, 2] = 255
+    col += CB
+    # BM
+    colorwheel[col:col+BM, 2] = 255
+    colorwheel[col:col+BM, 0] = np.floor(255 * np.arange(BM) / BM).astype(np.uint8)
+    col += BM
+    # MR
+    colorwheel[col:col+MR, 2] = 255 - np.floor(255 * np.arange(MR) / MR).astype(np.uint8)
+    colorwheel[col:col+MR, 0] = 255
 
-        _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        epe = torch.sum((flow_pr[0].cpu() - flow_gt)**2, dim=0).sqrt()
-        epe_list.append(epe.view(-1).numpy())
-
-    epe = np.mean(np.concatenate(epe_list))
-    print("Validation Chairs EPE: %f" % epe)
-    return {'chairs': epe}
-
-
-@torch.no_grad()
-def validate_sintel(model, iters=32):
-    """ Peform validation using the Sintel (train) split """
-    results = {}
-    for dstype in ['clean', 'final']:
-        val_dataset = datasets.MpiSintel(split='training', dstype=dstype)
-        epe_list = []
-
-        for val_id in range(len(val_dataset)):
-            image1, image2, flow_gt, _ = val_dataset[val_id]
-            image1 = image1[None].cuda()
-            image2 = image2[None].cuda()
-
-            padder = InputPadder(image1.shape)
-            image1, image2 = padder.pad(image1, image2)
-
-            flow_low, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-            flow = padder.unpad(flow_pr[0]).cpu()
-
-            epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
-            epe_list.append(epe.view(-1).numpy())
-
-        epe_all = np.concatenate(epe_list)
-        epe = np.mean(epe_all)
-        px1 = np.mean(epe_all<1)
-        px3 = np.mean(epe_all<3)
-        px5 = np.mean(epe_all<5)
-
-        print("Validation (%s) EPE: %f, 1px: %f, 3px: %f, 5px: %f" % (dstype, epe, px1, px3, px5))
-        results[dstype] = np.mean(epe_list)
-
-    return results
+    return colorwheel
 
 
-@torch.no_grad()
-def validate_kitti(model, iters=24):
-    """ Peform validation using the KITTI-2015 (train) split """
-    val_dataset = datasets.KITTI(split='training')
+def flow_to_image(flow_uv, clip_flow=None, convert_to_bgr=False):
+    """
+    Convert flow to RGB image using color wheel.
+    flow_uv: [H, W, 2] float32
+    """
+    flow = flow_uv.copy()
+    if clip_flow is not None:
+        flow = np.clip(flow, -clip_flow, clip_flow)
 
-    out_list, epe_list = [], []
-    for val_id in range(len(val_dataset)):
-        image1, image2, flow_gt, valid_gt = val_dataset[val_id]
-        image1 = image1[None].cuda()
-        image2 = image2[None].cuda()
+    u = flow[..., 0]
+    v = flow[..., 1]
 
-        padder = InputPadder(image1.shape, mode='kitti')
-        image1, image2 = padder.pad(image1, image2)
+    rad = np.sqrt(u * u + v * v)
+    rad_max = np.max(rad) + 1e-5
 
-        flow_low, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        flow = padder.unpad(flow_pr[0]).cpu()
+    u = u / rad_max
+    v = v / rad_max
 
-        epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
-        mag = torch.sum(flow_gt**2, dim=0).sqrt()
+    colorwheel = make_colorwheel()
+    ncols = colorwheel.shape[0]
 
-        epe = epe.view(-1)
-        mag = mag.view(-1)
-        val = valid_gt.view(-1) >= 0.5
+    a = np.arctan2(-v, -u) / np.pi
+    fk = (a + 1) / 2 * (ncols - 1)
+    k0 = np.floor(fk).astype(np.int32)
+    k1 = (k0 + 1) % ncols
+    f = fk - k0
 
-        out = ((epe > 3.0) & ((epe/mag) > 0.05)).float()
-        epe_list.append(epe[val].mean().item())
-        out_list.append(out[val].cpu().numpy())
+    img = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+    for i in range(3):
+        col0 = colorwheel[k0, i] / 255.0
+        col1 = colorwheel[k1, i] / 255.0
+        col = (1 - f) * col0 + f * col1
 
-    
-    epe_list = np.array(epe_list)
-    out_list = np.concatenate(out_list)
+        # decrease saturation with radius
+        col = 1 - rad / (rad_max) * (1 - col)
+        img[..., i] = np.floor(255 * col).astype(np.uint8)
 
-    epe = np.mean(epe_list)
-    f1 = 100 * np.mean(out_list)
-
-    print("Validation KITTI: %f, %f" % (epe, f1))
-    return {'kitti-epe': epe, 'kitti-f1': f1}
+    if convert_to_bgr:
+        img = img[..., ::-1]
+    return img
 
 
-if __name__ == '__main__':
+# -----------------------------
+# Utils: depth visualization (paper-style colormap)
+# -----------------------------
+def depth_to_colormap(depth, valid_mask=None, dmin=None, dmax=None):
+    """
+    depth: [H,W] float32
+    valid_mask: [H,W] bool
+    Returns uint8 RGB.
+    """
+    import matplotlib.cm as cm
+
+    dep = depth.copy()
+    if valid_mask is None:
+        valid_mask = np.isfinite(dep) & (dep > 0)
+
+    if dmin is None:
+        dmin = np.percentile(dep[valid_mask], 1) if np.any(valid_mask) else 0.0
+    if dmax is None:
+        dmax = np.percentile(dep[valid_mask], 99) if np.any(valid_mask) else 1.0
+    dmax = max(dmax, dmin + 1e-6)
+
+    dep = np.clip(dep, dmin, dmax)
+    dep_norm = (dep - dmin) / (dmax - dmin + 1e-6)
+
+    # common paper-like colormap: magma / plasma / inferno
+    cmap = cm.get_cmap("magma")
+    colored = cmap(dep_norm)[:, :, :3]  # [H,W,3] float
+    colored[~valid_mask] = 0.0
+    colored = (colored * 255.0).astype(np.uint8)
+    return colored
+
+
+def tensor_image_to_uint8(img_t):
+    """
+    img_t: torch tensor [3,H,W], values in [0,255] float
+    """
+    img = img_t.detach().cpu().numpy().transpose(1, 2, 0)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
+
+
+def save_png(path, arr_uint8):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    Image.fromarray(arr_uint8).save(path)
+
+
+def concat_horiz(img_list):
+    """Concatenate list of HxWx3 uint8 images horizontally with same height."""
+    H = img_list[0].shape[0]
+    outs = []
+    for im in img_list:
+        if im.shape[0] != H:
+            # resize to match height
+            w = int(im.shape[1] * (H / im.shape[0]))
+            im = np.array(Image.fromarray(im).resize((w, H), resample=Image.BILINEAR))
+        outs.append(im)
+    return np.concatenate(outs, axis=1)
+
+
+# -----------------------------
+# Build args (MUST include FlowSeek dependencies)
+# -----------------------------
+def build_args():
     base = os.path.dirname(__file__)
-    #获取训练好的模型权重路径
-    ckpt_path = os.path.join(base, "train_checkpoints", "raft_chairs2_kitti_ft.pth")
 
     args = SimpleNamespace(
-        model = ckpt_path,
-        dataset = "kitti",
-        feat_type = "dinov3",
-        split = 'testing',
-        dinov3_model = 'vitb16',
-        batch_size=6,
-        image_size=[320, 1152],
-        mixed_precision = True,
-        alternate_corr = False,
-        gpus=[0],  
-        corr_radius = 4
-        )
+        # paths
+        kitti_root=os.path.join(base, "data", "KITTI_split"),     # contains training/ testing/
+        split="testing",                                          # use testing
+        ckpt_path=os.path.join(base, "train_checkpoints", "deeplearning_depth.pth"),
 
-    model = torch.nn.DataParallel(RAFT(args), device_ids=args.gpus)
-    model.load_state_dict(torch.load(args.model),"cuda")
+        # inference
+        batch_size=1,
+        num_workers=2,
+        gpus=[0],
+        mixed_precision=True,
+        iters=4,              # must match training (or you can increase for better quality)
+        save_dir=os.path.join(base, "result_test", "deeplearning_depth"),
 
-    model.cuda()
+        # FlowSeek / ResNetFPN required hyperparams (copy from train.py defaults)
+        pretrain="resnet34",
+        initial_dim=64,
+        block_dims=[64, 128, 256],
+
+        radius=4,
+        dim=128,
+        num_blocks=2,
+
+        # flow uncertainty branch configs used in forward (safe defaults)
+        use_var=True,
+        var_min=0,
+        var_max=10,
+
+        # DepthAnythingV2 backbone size used in FlowSeek
+        da_size="vitb",        # must match available checkpoints: checkpoints/depth_anything_v2_vitb.pth
+
+        # (kept for compatibility)
+        dataset="kitti",
+        stage="test",
+    )
+    return args
+
+
+# -----------------------------
+# Data loader
+# -----------------------------
+def build_kitti_test_loader(args):
+    # datasets.py defines KITTI(root=... , split=...)
+    ds = datasets_module.KITTI(split=args.split, root=args.kitti_root)
+    loader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False
+    )
+    print(f"[INFO] KITTI {args.split} samples: {len(ds)}")
+    return loader
+
+
+# -----------------------------
+# Main inference
+# -----------------------------
+@torch.no_grad()
+def run_kitti_testing_inference(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] {device}")
+
+    loader = build_kitti_test_loader(args)
+
+    # Build model
+    model = FlowSeek(args).to(device)
     model.eval()
 
-    # create_sintel_submission(model.module, warm_start=True)
-    # create_kitti_submission(model.module)
+    # Load weights
+    load_checkpoint(model, args.ckpt_path, device)
 
-    with torch.no_grad():
-        if args.dataset == 'chairs':
-            validate_chairs(model.module)
+    # output dirs
+    out_rgb = os.path.join(args.save_dir, "rgb")
+    out_flow = os.path.join(args.save_dir, "flow")
+    out_depth = os.path.join(args.save_dir, "depth")
+    out_triplet = os.path.join(args.save_dir, "triplet")
 
-        elif args.dataset == 'sintel':
-            validate_sintel(model.module)
+    os.makedirs(out_rgb, exist_ok=True)
+    os.makedirs(out_flow, exist_ok=True)
+    os.makedirs(out_depth, exist_ok=True)
+    os.makedirs(out_triplet, exist_ok=True)
 
-        elif args.dataset == 'kitti':
-            validate_kitti(model.module)
+    for i, batch in enumerate(loader):
+        # KITTI in test mode returns (img1, img2, extra_info)
+        # but if split contains gt it may return 6-tuple. Handle both robustly.
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            image1, image2, extra = batch
+            frame_name = extra[0][0] if isinstance(extra, (list, tuple)) else f"{i:06d}_10.png"
+        else:
+            # supervised variant: img1,img2,flow,flow_valid,depth,depth_valid
+            image1, image2 = batch[0], batch[1]
+            frame_name = f"{i:06d}_10.png"
+
+        image1 = image1.to(device, non_blocking=True)
+        image2 = image2.to(device, non_blocking=True)
+
+        # forward
+        out = model(image1, image2, iters=args.iters, test_mode=True)
+
+        # Flow: out['final'] is [B,2,H,W]
+        flow = out["final"][0].detach().cpu().numpy().transpose(1, 2, 0).astype(np.float32)
+        flow_img = flow_to_image(flow)
+
+        # Depth: out['depth'] is [B,1,H,W]
+        depth = out.get("depth", None)
+        if depth is not None:
+            dep = depth[0, 0].detach().cpu().numpy().astype(np.float32)
+            dep_img = depth_to_colormap(dep, valid_mask=np.isfinite(dep) & (dep > 0))
+        else:
+            dep_img = np.zeros((flow_img.shape[0], flow_img.shape[1], 3), dtype=np.uint8)
+
+        # RGB for reference
+        rgb_img = tensor_image_to_uint8(image1[0])
+
+        # save
+        stem = os.path.splitext(frame_name)[0]
+        save_png(os.path.join(out_rgb, f"{stem}_rgb.png"), rgb_img)
+        save_png(os.path.join(out_flow, f"{stem}_flow.png"), flow_img)
+        save_png(os.path.join(out_depth, f"{stem}_depth.png"), dep_img)
+
+        trip = concat_horiz([rgb_img, flow_img, dep_img])
+        save_png(os.path.join(out_triplet, f"{stem}_triplet.png"), trip)
+
+        if (i + 1) % 5 == 0 or (i + 1) == len(loader):
+            print(f"[INFO] Processed {i+1}/{len(loader)}")
 
 
+if __name__ == "__main__":
+    args = build_args()
+    run_kitti_testing_inference(args)
